@@ -2195,7 +2195,8 @@ Label distribution: {stats['by_label']}"""
         "\n"
         "GOLDEN SQL PATTERNS (adapt to the user's question; do not copy unrelated filters):\n"
         "-- Unread, exclude 通知, newest first\n"
-        "SELECT a.* FROM articles a WHERE a.is_read = 0 AND IFNULL(a.label,'') != '通知' "
+        "SELECT a.* FROM articles a WHERE a.is_read = 0 "
+        "AND IFNULL(a.label,'') NOT IN ('未分类','通知') "
         "ORDER BY a.created_at DESC LIMIT 15\n"
         "\n"
         "-- Filter by label (articles.label OR user override label_name)\n"
@@ -2205,7 +2206,8 @@ Label distribution: {stats['by_label']}"""
         "ORDER BY a.created_at DESC LIMIT 15\n"
         "\n"
         "-- ~10 minutes available: read_time_min <= round(minutes * 1.4)\n"
-        "SELECT a.* FROM articles a WHERE a.is_read = 0 AND IFNULL(a.label,'') != '通知' "
+        "SELECT a.* FROM articles a WHERE a.is_read = 0 "
+        "AND IFNULL(a.label,'') NOT IN ('未分类','通知') "
         "AND a.read_time_min <= 14 ORDER BY a.created_at DESC LIMIT 10\n"
         "\n"
         "-- User asks about 通知/提醒/deadlines: MUST include 通知, do NOT exclude\n"
@@ -2227,12 +2229,13 @@ Label distribution: {stats['by_label']}"""
         "SNOOZE: Do NOT hard-exclude snoozed articles. Include them — the downstream scorer handles priority.\n"
         "\n"
         "RECOMMENDATION FILTERING (when user asks to recommend or mentions available time):\n"
-        "0. Exclude 通知 from casual recommendations: WHERE label != '通知'.\n"
+        "0. Exclude 未分类: always add WHERE label != '未分类' (unclassified = noise).\n"
+        "0.1 Exclude 通知 from casual recommendations: WHERE label != '通知'.\n"
         "   Only include 通知 when user explicitly asks about reminders/deadlines/提醒.\n"
-        "1. Prefer unread: is_read = 0 (but don't hard-exclude read articles).\n"
+        "1. MUST hard-exclude read articles: always add WHERE is_read = 0.\n"
         "2. If user specifies time: filter read_time_min <= time * 1.4, limit 10.\n"
         "3. If user specifies TOPIC: filter by topic. LIMIT 15.\n"
-        "4. If NO topic, NO time: just fetch is_read=0 AND label!='通知' LIMIT 15.\n"
+        "4. If NO topic, NO time: just fetch is_read=0 AND label!='未分类' AND label!='通知' LIMIT 15.\n"
         "5. Convert time units: 小时→×60, 分钟/分→×1, 半小时=30.\n"
         "6. SIMPLE ORDER BY is fine — the system re-scores everything. Use created_at DESC as default."
     )
@@ -2280,6 +2283,15 @@ Label distribution: {stats['by_label']}"""
 
     # ── Score & Sort: apply unified scoring to all candidates ──
     rows = database.compute_article_scores(list(rows))
+
+    # Safety net: for recommendation intents, drop already-read articles.
+    # The LLM-generated SQL should include is_read=0 per the prompt rules,
+    # but this guards against cases where it doesn't.
+    if intent == 'recommendation':
+        read_before = len(rows)
+        rows = [r for r in rows if not r.get('is_read')]
+        if len(rows) < read_before:
+            logger.info(f'Filtered out {read_before - len(rows)} already-read article(s) from recommend candidates')
 
     # Stage 2: Generate natural language response
     if not rows:

@@ -53,6 +53,14 @@ def init_db():
             conn.execute("ALTER TABLE articles ADD COLUMN extracted_deadline TEXT DEFAULT NULL")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE articles ADD COLUMN snooze_pending INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        # Backfill: existing snoozed articles should be pending acknowledgement
+        conn.execute(
+            "UPDATE articles SET snooze_pending = 1 WHERE snooze_until IS NOT NULL AND snooze_pending = 0"
+        )
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS articles (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +87,7 @@ def init_db():
                 deadline_at     TEXT DEFAULT NULL,
                 ddl_pending     INTEGER DEFAULT 0,
                 extracted_deadline TEXT DEFAULT NULL,
+                snooze_pending  INTEGER DEFAULT 0,
                 created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 updated_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
             );
@@ -296,13 +305,14 @@ def update_article(article_id, updates):
                 'readAt': 'read_at',
                 'labelConfirmed': 'label_confirmed',
                 'snoozeUntil': 'snooze_until',
+                'snoozePending': 'snooze_pending',
                 'deadlineAt': 'deadline_at',
                 'ddlPending': 'ddl_pending',
                 'extractedDeadline': 'extracted_deadline',
             }
             allowed_columns = {'is_read', 'read_at', 'label_confirmed', 'label',
                                'snooze_until', 'deadline_at', 'dismiss_count',
-                               'ddl_pending', 'extracted_deadline'}
+                               'ddl_pending', 'extracted_deadline', 'snooze_pending'}
             db_updates = {}
             for k, v in updates.items():
                 db_key = field_map.get(k, k)
@@ -449,7 +459,7 @@ def record_event(article_id, event_type, payload=None):
         # Update article state based on event type
         if event_type == 'snooze' and payload and payload.get('snooze_until'):
             conn.execute(
-                'UPDATE articles SET snooze_until = ?, updated_at = ? WHERE id = ?',
+                'UPDATE articles SET snooze_until = ?, snooze_pending = 1, updated_at = ? WHERE id = ?',
                 (payload['snooze_until'], ts, article_id)
             )
         elif event_type == 'dismiss':
@@ -508,14 +518,22 @@ def _get_article_score_internal(conn, article_id, user_profile=None):
             until = _dt.strptime(a['snooze_until'], '%Y-%m-%d %H:%M:%S')
             if until > _dt.now():
                 return 0
+            # Snooze expired but user hasn't acknowledged → still excluded
+            if a.get('snooze_pending'):
+                return 0
         except (ValueError, TypeError):
             pass
 
     score = 30
 
+    # ── Unclassified articles are noise — hard-exclude from recommendations ──
+    raw_label = (a.get('label', '') or '').strip()
+    if not raw_label or raw_label == '未分类':
+        return 0
+
     # ── Read status ──
     if a.get('is_read'):
-        score -= 50
+        score -= 120
     else:
         score += 20
 
@@ -576,6 +594,13 @@ def _get_article_score_internal(conn, article_id, user_profile=None):
         ).fetchone()['cnt']
         if label_read >= 2:
             score += min(label_read * 3, 18)  # +3 per completed read, cap +18
+
+    # ── Collection behavior weighting ──
+    # Heavily-collected labels reflect genuine interest — boost them.
+    collection_labels = user_profile.get('collection_labels', {})
+    if article_label and article_label in collection_labels:
+        col_weight = collection_labels[article_label]
+        score += min(int(col_weight * 5), 25)  # capped at +25
 
     # ── Time sensitivity: 通知 recency boost ──
     if article_label == '通知':
@@ -650,6 +675,9 @@ def _get_personalized_score_internal(conn, article_id, user_profile=None):
             until = _dt.strptime(a['snooze_until'], '%Y-%m-%d %H:%M:%S')
             if until > _dt.now():
                 return 0
+            # Snooze expired but user hasn't acknowledged → still excluded
+            if a.get('snooze_pending'):
+                return 0
         except (ValueError, TypeError):
             pass
 
@@ -664,9 +692,14 @@ def _get_personalized_score_internal(conn, article_id, user_profile=None):
 
     score = 30
 
+    # ── Unclassified articles are noise — hard-exclude from recommendations ──
+    raw_label = (a.get('label', '') or '').strip()
+    if not raw_label or raw_label == '未分类':
+        return 0
+
     # ── Read status ──
     if a.get('is_read'):
-        score -= 50
+        score -= 120
     else:
         score += 20
 
@@ -725,6 +758,13 @@ def _get_personalized_score_internal(conn, article_id, user_profile=None):
             else:
                 score += 5
             break
+
+    # ── Collection behavior weighting ──
+    # Heavily-collected labels reflect genuine interest — boost them.
+    collection_labels = user_profile.get('collection_labels', {})
+    if article_label and article_label in collection_labels:
+        col_weight = collection_labels[article_label]
+        score += min(int(col_weight * 5), 25)  # capped at +25
 
     # ── Reading-time preference ──
     pref_time = user_profile.get('preferred_time_min')
@@ -800,6 +840,11 @@ def _get_article_reasons(conn, article, user_profile=None):
     if len(top_labels) > 1 and article_label and top_labels[1]['label'] == article_label:
         reasons.append({'signal': 'label_top2', 'text': '符合你近期的阅读偏好', 'priority': 5})
 
+    # P5.5: Heavily collected label
+    collection_labels = user_profile.get('collection_labels', {})
+    if article_label and article_label in collection_labels and collection_labels[article_label] >= 3:
+        reasons.append({'signal': 'collection_weight', 'text': f'你收藏了很多「{article_label}」类文章', 'priority': 6})
+
     # P6: Label confidence high (+8)
     if a.get('label_confidence', 0) >= 60 and article_label and article_label != '未分类':
         reasons.append({'signal': 'confidence', 'text': f'AI 识别为「{article_label}」', 'priority': 6})
@@ -871,6 +916,7 @@ def _build_user_profile(conn):
         'preferred_time_min': None,
         'label_scores': {},
         'dismissed_labels': {},
+        'collection_labels': {},
     }
 
     # Event type base weights
@@ -926,7 +972,27 @@ def _build_user_profile(conn):
             rt = r['read_time_min']
             time_buckets[rt] = time_buckets.get(rt, 0) + abs(weighted)
 
-    # Sort labels by weighted score
+    # ── Collection behavior: count articles per label with time decay ──
+    # Adding articles to the library is itself a strong interest signal.
+    collection_rows = conn.execute(
+        """SELECT label, created_at FROM articles
+           WHERE label IS NOT NULL AND label != '未分类' AND label != '通知'"""
+    ).fetchall()
+    collection_labels = {}
+    for cr in collection_rows:
+        clabel = cr['label']
+        if '<' in clabel or '>' in clabel:
+            continue
+        try:
+            c_created = _dt.strptime(cr['created_at'], '%Y-%m-%d %H:%M:%S')
+            c_days = max((now - c_created).days, 0)
+        except (ValueError, TypeError):
+            c_days = 14
+        c_decay = math.exp(-DECAY_LAMBDA * c_days)
+        collection_labels[clabel] = collection_labels.get(clabel, 0) + c_decay
+    profile['collection_labels'] = collection_labels
+
+    # Sort labels by weighted score (event-based)
     sorted_labels = sorted(label_scores.items(), key=lambda x: x[1], reverse=True)
     profile['top_labels'] = [{'label': l, 'score': round(s, 1)} for l, s in sorted_labels[:5]]
     profile['label_scores'] = dict(sorted_labels)
@@ -998,7 +1064,8 @@ def get_recommendable_articles(limit=10, exclude_notification=True):
         profile = _build_user_profile(conn)
         sql = """SELECT id FROM articles
                  WHERE (snooze_until IS NULL OR snooze_until <= ?)
-                 AND is_read = 0"""
+                 AND is_read = 0
+                 AND label != '未分类'"""
         params = [now]
         if exclude_notification:
             top_label_names = {lb['label'] for lb in profile.get('top_labels', [])}
@@ -1065,7 +1132,8 @@ def get_personalized_top(limit=1, exclude_ids=None):
         sql = """SELECT id FROM articles
                  WHERE (snooze_until IS NULL OR snooze_until <= ?)
                  AND is_read = 0
-                 AND label != '通知'"""
+                 AND label != '通知'
+                 AND label != '未分类'"""
         params = [now]
         sql += " ORDER BY created_at DESC LIMIT 50"
         rows = conn.execute(sql, params).fetchall()
